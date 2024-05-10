@@ -14,6 +14,28 @@ from nacl.exceptions import (InvalidkeyError,
 
 LOG = logging.getLogger(__name__)
 
+
+class FromUser(Exception):
+    """Raised Exception on incorrect user input."""
+
+    def __str__(self):  # Informal description
+        """Return readable informal description."""
+        return 'Incorrect user input'
+
+    def __repr__(self):  # Technical description
+        """Return detailed, technical description."""
+        return str(self)
+
+
+class AlreadyInProgress(Warning):
+    """Raised when a file is already in progress."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __repr__(self):
+        return f'Warning: File already in progress or existing: {self.path}'
+
 def convert_error(func):
     def wrapper(*args, **kwargs):
         try:
@@ -42,3 +64,23 @@ def exit_on_invalid_passphrase(func):
             print('Invalid Key or Passphrase', file=sys.stderr)
             sys.exit(2)
     return wrapper
+
+
+class Crypt4GHHeaderDecryptionError(FromUser):
+    """Raised Exception when header decryption fails."""
+
+    def __str__(self):
+        return 'Error decrypting this Crypt4GH file'
+
+
+class SessionKeyDecryptionError(FromUser):
+    """Raised Exception when header decryption fails."""
+
+    def __init__(self, h):
+        self.header = h.hex().upper()
+
+    def __str__(self):
+        return 'Unable to decrypt header with master key'
+
+    def __repr__(self):
+        return f'Unable to decrypt header with master key: {self.header}'

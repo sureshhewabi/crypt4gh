@@ -7,12 +7,15 @@ import logging.config
 from functools import partial
 from getpass import getpass
 import re
+from pathlib import Path
+import io
 
 from docopt import docopt
 from nacl.public import PrivateKey
 
-from . import __title__, __version__, PROG
+from . import __title__, __version__, PROG, header
 from . import lib
+from .exceptions import Crypt4GHHeaderDecryptionError, SessionKeyDecryptionError, FromUser, AlreadyInProgress
 from .keys import get_public_key, get_private_key
 
 LOG = logging.getLogger(__name__)
@@ -26,10 +29,11 @@ __doc__ = f'''
 Utility for the cryptographic GA4GH standard, reading from stdin and outputting to stdout.
 
 Usage:
-   {PROG} [-hv] [--log <file>] encrypt [--sk <path>] --recipient_pk <path> [--recipient_pk <path>]... [--range <start-end>]
-   {PROG} [-hv] [--log <file>] decrypt [--sk <path>] [--sender_pk <path>] [--range <start-end>]
+   {PROG} [-hv] [--log <file>] encrypt [--sk <path>] --recipient_pk <path> [--recipient_pk <path>] --in <path> --out <path>... [--range <start-end>] 
+   {PROG} [-hv] [--log <file>] decrypt [--sk <path>] [--sender_pk <path>] --in <path> --out <path>... [--range <start-end>]
    {PROG} [-hv] [--log <file>] rearrange [--sk <path>] --range <start-end>
-   {PROG} [-hv] [--log <file>] reencrypt [--sk <path>] --recipient_pk <path> [--recipient_pk <path>]... [--trim]
+   {PROG} [-hv] [--log <file>] reencrypt [--sk <path>] --recipient_pk <path> [--recipient_pk <path>] --in <path> --out <path>... [--trim]
+   {PROG} [-hv] [--log <file>] split_header --sk <path> --recipient_pk <path>  --in <path> --out <path>
 
 Options:
    -h, --help             Prints this help and exit
@@ -41,6 +45,8 @@ Options:
    --sender_pk <path>     Peer's Curve25519-based Public key to verify provenance (akin to signature)
    --range <start-end>    Byte-range either as  <start-end> or just <start> (Start included, End excluded)
    -t, --trim             Keep only header packets that you can decrypt
+   --in <path>            Input file
+   --out <path>           Output file
 
 
 Environment variables:
@@ -146,11 +152,20 @@ def encrypt(args):
     if not recipient_keys:
         raise ValueError("No Recipients' Public Key found")
 
-    lib.encrypt(recipient_keys,
-                sys.stdin.buffer,
-                sys.stdout.buffer,
-                offset = range_start,
-                span = range_span)
+    infile_path = args['--in']
+    outfile_path = args['--out']
+    # Ensure infile_path is a single string, not a list
+    if isinstance(infile_path, list):
+        infile_path = infile_path[0]
+    if isinstance(outfile_path, list):
+        outfile_path = outfile_path[0]
+
+    with open(infile_path, 'rb') as infile, open(outfile_path, 'wb') as outfile:
+        lib.encrypt(recipient_keys,
+                    infile,
+                    outfile,
+                    offset = range_start,
+                    span = range_span)
     
 
 def decrypt(args):
@@ -164,12 +179,21 @@ def decrypt(args):
 
     keys = [(0, seckey, None)] # keys = list of (method, privkey, recipient_pubkey=None)
 
-    lib.decrypt(keys,
-                sys.stdin.buffer,
-                sys.stdout.buffer,
-                offset = range_start,
-                span = range_span,
-                sender_pubkey=sender_pubkey)
+    infile_path = args['--in']
+    outfile_path = args['--out']
+    # Ensure infile_path is a single string, not a list
+    if isinstance(infile_path, list):
+        infile_path = infile_path[0]
+    if isinstance(outfile_path, list):
+        outfile_path = outfile_path[0]
+
+    with open(infile_path, 'rb') as infile, open(outfile_path, 'wb') as outfile:
+        lib.decrypt(keys,
+                    infile,
+                    outfile,
+                    offset = range_start,
+                    span = range_span,
+                    sender_pubkey=sender_pubkey)
 
 
 def rearrange(args):
@@ -208,8 +232,62 @@ def reencrypt(args):
     if not recipient_keys:
         raise ValueError("No Recipients' Public Key found")
 
-    lib.reencrypt([(0, seckey, None)], # sender_keys
-                  recipient_keys,
-                  sys.stdin.buffer,
-                  sys.stdout.buffer,
-                  trim=args['--trim'])
+    infile_path = args['--in']
+    outfile_path = args['--out']
+    # Ensure infile_path is a single string, not a list
+    if isinstance(infile_path, list):
+        infile_path = infile_path[0]
+    if isinstance(outfile_path, list):
+        outfile_path = outfile_path[0]
+
+    with open(infile_path, 'rb') as infile, open(outfile_path, 'wb') as outfile:
+        lib.reencrypt([(0, seckey, None)], # sender_keys
+                      recipient_keys,
+                      infile,
+                      outfile,
+                      trim=args['--trim'])
+
+
+def split_header(args):
+
+    assert ( args['split_header'] )
+
+    infile_path = args['--in']
+    outfile_path = args['--out']
+    # Ensure infile_path is a single string, not a list
+    if isinstance(infile_path, list):
+        infile_path = infile_path[0]
+    if isinstance(outfile_path, list):
+        outfile_path = outfile_path[0]
+
+    LOG.info('Separating header from file: %s', infile_path)
+
+    if not os.path.exists(infile_path):
+        raise FileNotFoundError(infile_path)  # return early
+
+    with open(infile_path, 'rb') as infile, open(outfile_path, 'wb') as outfile:  # and truncate stage file
+
+        LOG.debug('Reading header')
+        try:
+            seckey = retrieve_private_key(args, generate=False)
+            service_key = (0, seckey, None)  # not checking the sender
+            # Get session keys
+            session_keys, edit_list = header.deconstruct(infile, [service_key])
+        except Exception as e:
+            LOG.error('Decryption error: %r', e)
+            raise Crypt4GHHeaderDecryptionError() from e
+
+        # Raise error we could not decrypt the header (ie no session keys retrieved)
+        if not session_keys:
+            raise SessionKeyDecryptionError('No session keys found')
+
+        if edit_list:
+            raise FromUser('Support for Crypt4GH edit list has been removed')
+
+        # The infile is left right at the position of the payload
+        pos = infile.tell()
+
+        # Just record the header.
+        infile.seek(0, io.SEEK_SET)  # rewind to beginning (it's ok: not a stream)
+        header_bytes = infile.read(pos)
+        outfile.write(header_bytes)

@@ -4,7 +4,7 @@
 import sys
 #import traceback
 
-from . import cli
+from crypt4gh import cli
 
 def main(argv=sys.argv[1:]):
     try:
@@ -13,7 +13,7 @@ def main(argv=sys.argv[1:]):
         args = cli.parse_args(argv)
 
         # Main Commands
-        for command in ('encrypt', 'decrypt', 'rearrange', 'reencrypt'):
+        for command in ('encrypt', 'decrypt', 'rearrange', 'reencrypt', 'split_header'):
             if args.get(command):
                 cmd = getattr(cli,command,None)
                 if not cmd:
